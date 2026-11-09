@@ -131,7 +131,6 @@ This works in both Termux and proot Debian.
 - `llama-server --version` reports the build number (`b12024`). If you see a different number, you are running a different installation — check `which llama-server` and `echo $PATH`.
 - The full list of binaries in the release: `llama-server`, `llama-cli`, `llama-bench`, `llama-quantize`, `llama-gguf-split`, `llama-tokenize`, `llama-embedding`, `llama-perplexity`. All are installed by the steps above.
 - The tarball also contains a `README.txt` with the upstream instructions; it is identical in content to this section, so you can ignore it.
-```
 
 ## Installation
 
