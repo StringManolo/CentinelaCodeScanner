@@ -38,12 +38,12 @@ import requests
 LABELS_PATH = Path(__file__).parent / "labels.json"
 MODEL_DIR = Path(__file__).parent / "centinela-scanner-models"
 REPORTS_DIR = Path(__file__).parent / "reports"
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 150
+CHUNK_SIZE = 2000 # before was 1200
+CHUNK_OVERLAP = 200 # before was 150
 REQUEST_TIMEOUT = 180
 SERVER_START_TIMEOUT = 180
 SERVER_SHUTDOWN_TIMEOUT = 10
-TOP_LOGPROBS = 20
+TOP_LOGPROBS = 5 # before was 20
 MAX_SCAN_POSITIONS = 5
 
 DEFAULT_SUSPICIOUS_CONF = 0.7
