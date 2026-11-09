@@ -138,8 +138,8 @@ This works in both Termux and proot Debian.
 ## Installation
 
 ```bash
-git clone https://github.com/StringManolo/centinela-code-scanner.git
-cd centinela-code-scanner
+git clone https://github.com/StringManolo/CentinelaCodeScanner.git
+cd CentinelaCodeScanner
 
 # Vendor the CLI parser
 git clone --depth 1 https://github.com/stringmanolo/simpleargumentsparser.git vendor/simpleargumentsparser
