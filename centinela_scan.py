@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -276,10 +277,63 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 def spawn_server(model_path: Path, port: int) -> subprocess.Popen:
+    """
+    Launch llama-server with settings tuned for Huawei P40 Lite
+    (Kirin 810: 2× Cortex-A76 @ 2.2 GHz + 6× Cortex-A55 @ 1.88 GHz).
+
+    Tunables via env vars (all optional):
+      CENTINELA_THREADS         default 3  (2×A76+1×A55 = 7.5 t/s; 8 is worse)
+      CENTINELA_THREADS_BATCH   default 2  (A76 only, less thermal throttling)
+      CENTINELA_CTX             default 4096 (1200-char chunks + template fit fine)
+    """
+    threads = int(os.environ.get("CENTINELA_THREADS", "3"))
+    threads_batch = int(os.environ.get("CENTINELA_THREADS_BATCH", "2"))
+    ctx = int(os.environ.get("CENTINELA_CTX", "4096"))
+
+    cmd = [
+        "llama-server",
+        "-m", str(model_path),
+        "--host", "127.0.0.1",
+        "--port", str(port),
+
+        # --- CPU tuning (Kirin 810) ---
+        "--threads", str(threads),
+        "--threads-batch", str(threads_batch),
+
+        # --- Context & prefill ---
+        "-c", str(ctx),
+        "-b", "512",
+        "-ub", "256",
+
+        # --- Output cap (API overrides per-request n_predict) ---
+        "-n", "32",
+
+        # --- Single slot, quantized KV cache ---
+        "--parallel", "1",
+        "--cache-ram", "256",
+        "--cache-type-k", "q8_0",
+        "--cache-type-v", "f16",
+
+        # --- No prompt shifting, no vision, no remote ---
+        "--no-context-shift",
+        "--no-mmproj",
+        "--no-webui",
+        "--offline",
+        "--log-colors", "off",
+
+        # --- Deterministic output (classification = argmax over labels) ---
+        "--temp", "0.0",
+        "--top-k", "1",
+        "--top-p", "1.0",
+        "--min-p", "0.0",
+        "--repeat-penalty", "1.0",
+        "--repeat-last-n", "0",
+    ]
+
     proc = subprocess.Popen(
-        ["llama-server", "-m", str(model_path), "--port", str(port),
-         "--host", "127.0.0.1", "-c", "2048", "--no-webui"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     url = f"http://127.0.0.1:{port}"
     t0 = time.time()
@@ -296,6 +350,11 @@ def spawn_server(model_path: Path, port: int) -> subprocess.Popen:
     proc.terminate()
     proc.wait(timeout=SERVER_SHUTDOWN_TIMEOUT)
     raise RuntimeError(f"server failed to start within {SERVER_START_TIMEOUT}s")
+
+
+
+
+
 
 def kill_server(proc: Optional[subprocess.Popen]):
     if proc is None or proc.poll() is not None:
