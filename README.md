@@ -21,8 +21,6 @@ Given a directory, it walks every code file recursively, chunks each file, asks 
 - `llama-server` in `PATH` (from [llama.cpp](https://github.com/ggerganov/llama.cpp))
 - ~1.7 GB of free disk space for both GGUF models
 
-Add this section to `README.md`, right after `## Requirements` and before `## Installation` (it explains how to satisfy the `llama-server` requirement on ARM64 Termux):
-
 ## Installing llama.cpp in Termux
 
 `centinela_scan.py` requires `llama-server` in `PATH`. On x86_64 desktops this comes from [llama.cpp](https://github.com/ggerganov/llama.cpp) built from source. On ARM64 Android, the easiest path is the prebuilt **b12024** binaries from the [StringManolo/llama.cpp release](https://github.com/StringManolo/llama.cpp/releases/tag/b12024-aarch64), which has two tarballs covering the two Termux environments:
