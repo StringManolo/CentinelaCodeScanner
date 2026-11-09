@@ -7,9 +7,16 @@ Modes:
   precise       1.5B only
   fast+precise  0.5B screens all files; 1.5B re-checks only the hits
 
+Key design:
+  * Prompts are wrapped in ChatML (matches training).
+  * Classification uses argmax over the log-probs of the first token of each
+    label. Generation is only used as a fallback for multi-token labels.
+  * If the model returns nothing usable, the chunk is labelled UNKNOWN, not
+    SAFE (a "no signal" is not the same as "safe").
+
 Reports (always written to reports/<ts>_<mode>/):
   vulns.txt              confirmed vulnerable files, sorted by confidence desc
-  unconfirmed_vulns.txt  flagged by 0.5B but 1.5B didn't confirm (fast+precise only)
+  unconfirmed_vulns.txt  0.5B flagged, 1.5B didn't confirm (fast+precise only)
   suspicious_safe.txt    SAFEs with low P(SAFE) or a vuln candidate
   all_by_risk.txt        everything, sorted by risk desc
   summary.json           metadata
@@ -40,7 +47,7 @@ CHUNK_OVERLAP = 150
 REQUEST_TIMEOUT = 180
 SERVER_START_TIMEOUT = 180
 SERVER_SHUTDOWN_TIMEOUT = 10
-TOP_LOGPROBS = 30
+TOP_LOGPROBS = 50
 
 DEFAULT_SUSPICIOUS_CONF = 0.7
 DEFAULT_SUSPICIOUS_VULN_PROB = 0.15
@@ -109,6 +116,16 @@ REPORTS:
       vuln        -> confidence
       unconfirmed -> max(confidence, 1 - phase2_safe_conf)
       safe        -> 1 - confidence
+
+CHATML:
+    The prompt is wrapped in ChatML (same format the model saw in training):
+      <|im_start|>system
+      You are a helpful assistant.<|im_end|>
+      <|im_start|>user
+      ...<|im_end|>
+      <|im_start|>assistant
+    Without this, the model continues the document instead of answering,
+    producing SAFE with P=0.000 on files it would otherwise detect.
 """
 
 def print_help():
@@ -171,7 +188,7 @@ def parse_args():
     try:
         min_safe_conf = float(min_safe_conf_raw) if min_safe_conf_raw else 0.0
     except (ValueError, TypeError):
-        print(f"error: --min-safe-conf must be a number", file=sys.stderr)
+        print("error: --min-safe-conf must be a number", file=sys.stderr)
         sys.exit(2)
 
     return {
@@ -199,14 +216,26 @@ def load_labels():
     return labels
 
 LABELS = load_labels()
-PROMPT_TMPL = (
+LABELS_SET = set(LABELS)
+LABELS_SET.discard("SAFE")  # SAFE handled separately
+LABELS_SET.add("SAFE")
+
+INNER_PROMPT = (
     "Analyze the following code for security vulnerabilities.\n"
     "If it is vulnerable, answer with the vulnerability type; if it is not, answer SAFE.\n"
     "Answer with exactly one of: {labels}.\n\nCode:\n```\n{code}\n```"
 )
 
+# ChatML wrapping (matches the model's training format exactly)
+CHATML_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+CHATML_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+
+def build_full_prompt(code: str) -> str:
+    inner = INNER_PROMPT.format(labels=", ".join(LABELS), code=code)
+    return CHATML_PREFIX + inner + CHATML_SUFFIX
+
 # ---------------------------------------------------------------------------
-# Label normalisation
+# Label-text normalisation and first-token map
 # ---------------------------------------------------------------------------
 def _normalize(s: str) -> str:
     s = (s or "").upper().strip()
@@ -215,25 +244,44 @@ def _normalize(s: str) -> str:
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
-def extract_label(content: str) -> str:
+def extract_label_from_text(content: str) -> Optional[str]:
+    """Try to map the generated text to a label. Returns None if unclear."""
     norm = _normalize(content)
     if not norm:
-        return "SAFE"
-    for L in LABELS:
-        if norm == L.upper():
-            return L
+        return None
+    # Exact match first
+    if norm in LABELS_SET:
+        return norm
+    # Prefix match (sorted by length so longer labels win)
     for L in sorted(LABELS, key=len, reverse=True):
         if norm.startswith(L.upper()):
             return L
-    return "SAFE"
+    return None
 
-def matches_label_start(norm_token: str, label: str) -> bool:
-    L = label.upper()
-    if not norm_token or not L.startswith(norm_token):
-        return False
-    if len(norm_token) >= len(L):
-        return norm_token == L
-    return L[len(norm_token)] == "_"
+def build_first_token_map() -> dict:
+    """
+    Map "possible first tokens" -> [labels whose text starts that way].
+
+    Example: "CODE" -> ["CODE_INJECTION"], "CRLF" -> ["CRLF_INJECTION"],
+             "XSS" -> ["XSS"], "SQLI" -> ["SQLI"].
+    This is a heuristic; it assumes labels tokenise at word/underscore
+    boundaries, which is true for the Centinela label vocabulary.
+    """
+    m = {}
+    for L in LABELS:
+        # Full label as a possible single-token emission
+        m.setdefault(L, []).append(L)
+        # Underscore prefixes
+        parts = L.split("_")
+        for i in range(1, len(parts)):
+            prefix = "_".join(parts[:i])
+            if prefix not in m:
+                m[prefix] = []
+            if L not in m[prefix]:
+                m[prefix].append(L)
+    return m
+
+FIRST_TOKEN_MAP = build_first_token_map()
 
 # ---------------------------------------------------------------------------
 # File discovery & chunking
@@ -266,11 +314,13 @@ def free_port() -> int:
 def spawn_server(model_path: Path, port: int) -> subprocess.Popen:
     """
     Launch llama-server with settings tuned for Huawei P40 Lite.
-    Env overrides: CENTINELA_THREADS (3), CENTINELA_THREADS_BATCH (2),
-                   CENTINELA_CTX (4096)
+    Env overrides:
+      CENTINELA_THREADS         default 3 (2×A76+1×A55)
+      CENTINELA_THREADS_BATCH   default 3 (prefill benefits from more threads)
+      CENTINELA_CTX             default 4096
     """
     threads = int(os.environ.get("CENTINELA_THREADS", "3"))
-    threads_batch = int(os.environ.get("CENTINELA_THREADS_BATCH", "2"))
+    threads_batch = int(os.environ.get("CENTINELA_THREADS_BATCH", "3"))
     ctx = int(os.environ.get("CENTINELA_CTX", "4096"))
 
     cmd = [
@@ -278,26 +328,27 @@ def spawn_server(model_path: Path, port: int) -> subprocess.Popen:
         "-m", str(model_path),
         "--host", "127.0.0.1",
         "--port", str(port),
-        # CPU tuning (Kirin 810: 2× A76 + 6× A55; 3 threads ~= 7.5 t/s, 8 is worse)
+        # CPU tuning
         "--threads", str(threads),
         "--threads-batch", str(threads_batch),
-        # Context: our chunks are ~1200 chars, template ~200, so 4096 is plenty
+        # Context
         "-c", str(ctx),
-        "-b", "512",
-        "-ub", "256",
+        # Bigger batch / ubatch = fewer sequential forward passes for prefill
+        "-b", "1024",
+        "-ub", "512",
         "-n", "24",
-        # Single slot, quantized KV cache
+        # Single slot, KV cache config
         "--parallel", "1",
-        "--cache-ram", "256",
-        "--cache-type-k", "q8_0",
+        "--cache-ram", "512",
+        "--cache-type-k", "q4_0",
         "--cache-type-v", "f16",
-        # No prompt shifting, no vision, no remote calls
+        # Behavior
         "--no-context-shift",
         "--no-mmproj",
         "--no-webui",
         "--offline",
         "--log-colors", "off",
-        # Greedy sampling (classification is argmax, not creative generation)
+        # Deterministic sampling
         "--temp", "0.0",
         "--top-k", "1",
         "--top-p", "1.0",
@@ -379,46 +430,27 @@ def ensure_model(kind: str, provided: Optional[str], no_download: bool) -> Path:
     return target
 
 # ---------------------------------------------------------------------------
-# Classification
+# Classification (ChatML + argmax over logprobs)
 # ---------------------------------------------------------------------------
-def classify_chunk(server: str, code: str) -> dict:
-    """
-    Returns: {label, confidence, max_vuln_label, max_vuln_prob, empty_output}
-      empty_output=True means the model returned nothing usable (suspicious).
-    """
-    prompt = PROMPT_TMPL.format(labels=", ".join(LABELS), code=code)
-    payload = {
-        "prompt": prompt,
-        "temperature": 0.0,
-        "n_predict": 24,
-        "logprobs": True,
-        "top_logprobs": TOP_LOGPROBS,
-        "n_probs": TOP_LOGPROBS,   # legacy alias, ignored if unsupported
-        "stop": ["```"],           # no single-\n stop: avoid empty outputs
-    }
-    try:
-        r = requests.post(f"{server}/completion", json=payload, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  warning: request failed ({e})", file=sys.stderr)
-        return {"label": "SAFE", "confidence": 0.0,
-                "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
+def _prob_of_token(cp_dict, token_text: str) -> Optional[float]:
+    """Look up the probability of `token_text` in a completion_probabilities entry's top_logprobs."""
+    cands = (cp_dict.get("top_logprobs")
+             or cp_dict.get("n_probs")
+             or cp_dict.get("top_candidates")
+             or [])
+    for cand in cands:
+        if (cand.get("content") or "").strip().upper() == token_text.upper():
+            if "prob" in cand:
+                return float(cand["prob"])
+            if "logprob" in cand:
+                return math.exp(float(cand["logprob"]))
+    return None
 
-    data = r.json()
-    content = (data.get("content") or "").strip()
-    label = extract_label(content)
-
-    completion_probs = data.get("completion_probabilities") or []
-    if not completion_probs:
-        # Model returned no logprobs: very suspicious, flag it.
-        return {"label": label, "confidence": 0.0,
-                "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
-
-    # Confidence = geometric mean of per-token probabilities up to the label
+def _geometric_mean_emitted(completion_probs, label: str) -> float:
+    """Geometric mean of the per-token probabilities up to the emitted label."""
     cumulative = ""
     sum_lp = 0.0
     n = 0
-    matched = False
     for cp in completion_probs:
         piece = cp.get("content", "")
         if "logprob" in cp:
@@ -431,53 +463,164 @@ def classify_chunk(server: str, code: str) -> dict:
         sum_lp += lp
         n += 1
         if _normalize(cumulative) == label.upper():
-            matched = True
             break
-    confidence = math.exp(sum_lp / max(n, 1)) if n > 0 else 0.0
+    return math.exp(sum_lp / max(n, 1)) if n > 0 else 0.0
 
-    # max_vuln: inspect top alternatives at position 0
-    max_vuln_label = None
-    max_vuln_prob = 0.0
+def _argmax_over_labels(completion_probs) -> tuple[Optional[str], float]:
+    """
+    Argmax over the log-probs of the first token of each label.
+
+    Look at the FIRST completion position's top_logprobs, map each token
+    to candidate labels via FIRST_TOKEN_MAP, and pick the label with the
+    highest probability.
+    """
+    if not completion_probs:
+        return None, 0.0
+
     first = completion_probs[0]
-    candidates = (first.get("top_logprobs")
-                  or first.get("n_probs")
-                  or first.get("top_candidates")
-                  or [])
-    for cand in candidates:
-        ctoken = cand.get("content", "")
+    cands = (first.get("top_logprobs")
+             or first.get("n_probs")
+             or first.get("top_candidates")
+             or [])
+
+    label_scores = {}
+    for cand in cands:
+        token = (cand.get("content") or "").strip().upper()
+        if not token:
+            continue
+        if token not in FIRST_TOKEN_MAP:
+            continue
         if "prob" in cand:
-            cprob = float(cand["prob"])
+            prob = float(cand["prob"])
         elif "logprob" in cand:
-            cprob = math.exp(float(cand["logprob"]))
+            prob = math.exp(float(cand["logprob"]))
         else:
             continue
-        cnorm = _normalize(ctoken)
-        for L in LABELS:
+        for L in FIRST_TOKEN_MAP[token]:
+            if prob > label_scores.get(L, 0.0):
+                label_scores[L] = prob
+
+    if not label_scores:
+        return None, 0.0
+
+    best_label = max(label_scores, key=label_scores.get)
+    return best_label, label_scores[best_label]
+
+def _max_vuln_from_completion(completion_probs) -> tuple[Optional[str], float]:
+    """Best vulnerability candidate seen at position 0 (may be None)."""
+    if not completion_probs:
+        return None, 0.0
+    first = completion_probs[0]
+    cands = (first.get("top_logprobs")
+             or first.get("n_probs")
+             or first.get("top_candidates")
+             or [])
+    max_vuln_label = None
+    max_vuln_prob = 0.0
+    for cand in cands:
+        token = (cand.get("content") or "").strip().upper()
+        if not token:
+            continue
+        if token not in FIRST_TOKEN_MAP:
+            continue
+        if "prob" in cand:
+            prob = float(cand["prob"])
+        elif "logprob" in cand:
+            prob = math.exp(float(cand["logprob"]))
+        else:
+            continue
+        for L in FIRST_TOKEN_MAP[token]:
             if L == "SAFE":
                 continue
-            if matches_label_start(cnorm, L) and cprob > max_vuln_prob:
-                max_vuln_prob = cprob
+            if prob > max_vuln_prob:
+                max_vuln_prob = prob
                 max_vuln_label = L
-                break
+    return max_vuln_label, max_vuln_prob
 
-    return {"label": label, "confidence": confidence,
-            "max_vuln_label": max_vuln_label, "max_vuln_prob": max_vuln_prob,
+def classify_chunk(server: str, code: str) -> dict:
+    """
+    Classify a single code chunk.
+
+    Strategy:
+      1. Send ChatML-wrapped prompt, ask for 1 generated token with top_logprobs.
+      2. Argmax over labels using the first-token log-probs.
+      3. If the emitted text parses to a valid label AND its probability is
+         higher than the argmax, prefer the emitted label with geometric-mean
+         confidence (this catches multi-token labels where first-token only
+         underestimates).
+
+    Returns: {label, confidence, max_vuln_label, max_vuln_prob, empty_output}
+      label = "UNKNOWN" if there was no usable signal at all.
+    """
+    full_prompt = build_full_prompt(code)
+    payload = {
+        "prompt": full_prompt,
+        "temperature": 0.0,
+        "n_predict": 24,
+        "logprobs": True,
+        "top_logprobs": TOP_LOGPROBS,
+        "n_probs": TOP_LOGPROBS,
+        "stop": ["<|im_end|>"],
+    }
+
+    try:
+        r = requests.post(f"{server}/completion", json=payload, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  warning: request failed ({e})", file=sys.stderr)
+        return {"label": "UNKNOWN", "confidence": 0.0,
+                "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
+
+    data = r.json()
+    content = (data.get("content") or "").strip()
+    completion_probs = data.get("completion_probabilities") or []
+
+    # --- Signal 1: emitted label ---
+    emitted_label = extract_label_from_text(content)
+    emitted_conf = 0.0
+    if emitted_label and completion_probs:
+        emitted_conf = _geometric_mean_emitted(completion_probs, emitted_label)
+
+    # --- Signal 2: argmax over first-token logprobs ---
+    argmax_label, argmax_conf = _argmax_over_labels(completion_probs)
+
+    # --- Pick the stronger signal ---
+    best_label = None
+    best_conf = 0.0
+    if emitted_label and emitted_conf >= argmax_conf:
+        best_label, best_conf = emitted_label, emitted_conf
+    elif argmax_label:
+        best_label, best_conf = argmax_label, argmax_conf
+
+    max_vuln_label, max_vuln_prob = _max_vuln_from_completion(completion_probs)
+
+    if best_label is None:
+        return {"label": "UNKNOWN", "confidence": 0.0,
+                "max_vuln_label": max_vuln_label,
+                "max_vuln_prob": max_vuln_prob,
+                "empty_output": not bool(content)}
+
+    return {"label": best_label, "confidence": best_conf,
+            "max_vuln_label": max_vuln_label,
+            "max_vuln_prob": max_vuln_prob,
             "empty_output": False}
 
 def scan_file(server: str, path: Path) -> dict:
     try:
         text = path.read_text(errors="ignore")
     except OSError:
-        return {"role": "safe", "label": "SAFE", "confidence": 0.0,
+        return {"role": "unknown", "label": "UNKNOWN", "confidence": 0.0,
                 "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
 
     chunk_results = [classify_chunk(server, c) for c in chunks(text)]
     if not chunk_results:
-        return {"role": "safe", "label": "SAFE", "confidence": 0.0,
+        return {"role": "unknown", "label": "UNKNOWN", "confidence": 0.0,
                 "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
 
-    vuln_chunks = [r for r in chunk_results if r["label"] != "SAFE"]
+    vuln_chunks = [r for r in chunk_results
+                   if r["label"] != "SAFE" and r["label"] != "UNKNOWN"]
     safe_chunks = [r for r in chunk_results if r["label"] == "SAFE"]
+    unknown_chunks = [r for r in chunk_results if r["label"] == "UNKNOWN"]
 
     if vuln_chunks:
         best = max(vuln_chunks, key=lambda r: r["confidence"])
@@ -486,7 +629,8 @@ def scan_file(server: str, path: Path) -> dict:
                 "max_vuln_label": best["max_vuln_label"],
                 "max_vuln_prob": best["max_vuln_prob"],
                 "empty_output": best.get("empty_output", False)}
-    else:
+
+    if safe_chunks:
         worst = min(safe_chunks, key=lambda r: r["confidence"])
         return {"role": "safe", "label": "SAFE",
                 "confidence": worst["confidence"],
@@ -494,19 +638,28 @@ def scan_file(server: str, path: Path) -> dict:
                 "max_vuln_prob": worst["max_vuln_prob"],
                 "empty_output": worst.get("empty_output", False)}
 
+    # Only UNKNOWN chunks
+    return {"role": "unknown", "label": "UNKNOWN", "confidence": 0.0,
+            "max_vuln_label": None, "max_vuln_prob": 0.0, "empty_output": True}
+
 def run_scan(files: list, server: str, phase: str = "fast") -> list:
     results = []
     total = len(files)
     for i, f in enumerate(files, 1):
+        t0 = time.time()
         result = scan_file(server, f)
+        elapsed = time.time() - t0
         result["phase"] = phase
+        result["elapsed_s"] = round(elapsed, 2)
         results.append((f, result))
         if result["role"] == "vuln":
-            print(f"[{i}/{total}] {f} -> {result['label']} ({result['confidence']:.3f})",
+            print(f"[{i}/{total}] {f} -> {result['label']} ({result['confidence']:.3f}) [{elapsed:.1f}s]",
+                  file=sys.stderr)
+        elif result["role"] == "safe":
+            print(f"[{i}/{total}] {f} -> SAFE ({result['confidence']:.3f}) [{elapsed:.1f}s]",
                   file=sys.stderr)
         else:
-            print(f"[{i}/{total}] {f} -> SAFE ({result['confidence']:.3f})",
-                  file=sys.stderr)
+            print(f"[{i}/{total}] {f} -> UNKNOWN [{elapsed:.1f}s]", file=sys.stderr)
     return results
 
 # ---------------------------------------------------------------------------
@@ -538,13 +691,13 @@ def _is_suspicious(conf: float, max_vuln_prob: float, threshold_conf: float) -> 
     return reasons
 
 def write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
-                  safes, all_results, elapsed, threshold_conf):
+                  safes, unknowns, all_results, elapsed, threshold_conf):
     run_dir = REPORTS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- vulns.txt (confirmed) ---
+    # --- vulns.txt ---
     with open(run_dir / "vulns.txt", "w", encoding="utf-8") as f:
-        f.write(f"# Centinela Code Scanner — confirmed vulnerable files\n")
+        f.write("# Centinela Code Scanner — confirmed vulnerable files\n")
         f.write(f"# run: {run_id}  mode: {mode}  root: {args['path']}\n")
         f.write(f"# count: {len(confirmed_vulns)}\n")
         f.write(f"# format: confidence\\tlabel\\tphase\\tpath\n")
@@ -554,7 +707,7 @@ def write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
 
     # --- unconfirmed_vulns.txt ---
     with open(run_dir / "unconfirmed_vulns.txt", "w", encoding="utf-8") as f:
-        f.write(f"# Centinela Code Scanner — 0.5B flagged, 1.5B didn't confirm\n")
+        f.write("# Centinela Code Scanner — 0.5B flagged, 1.5B didn't confirm\n")
         f.write(f"# count: {len(unconfirmed_vulns)}\n")
         f.write(f"# format: risk\\tfast_conf\\tfast_label\\tprecise_safe_conf\\tpath\n")
         f.write("#" + "-" * 78 + "\n")
@@ -572,7 +725,7 @@ def write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
     suspicious.sort(key=lambda x: x[0], reverse=True)
 
     with open(run_dir / "suspicious_safe.txt", "w", encoding="utf-8") as f:
-        f.write(f"# Centinela Code Scanner — suspicious SAFE (possible false negatives)\n")
+        f.write("# Centinela Code Scanner — suspicious SAFE (possible false negatives)\n")
         f.write(f"# criteria: P(SAFE)<{threshold_conf:.2f} OR max_vuln_prob>="
                 f"{DEFAULT_SUSPICIOUS_VULN_PROB:.2f}\n")
         f.write(f"# count: {len(suspicious)} / {len(safes)} safes\n")
@@ -593,12 +746,15 @@ def write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
     for p, r in safes:
         risk = max(1.0 - r["confidence"], r["max_vuln_prob"])
         combined.append((risk, "safe", "SAFE", r["phase"], p))
+    for p, r in unknowns:
+        combined.append((0.0, "unknown", "UNKNOWN", r["phase"], p))
     combined.sort(key=lambda x: x[0], reverse=True)
 
     with open(run_dir / "all_by_risk.txt", "w", encoding="utf-8") as f:
-        f.write(f"# Centinela Code Scanner — all files by risk\n")
-        f.write(f"# risk: vuln=confidence, unconfirmed=max(conf,1-precise_safe), safe=1-confidence\n")
-        f.write(f"# format: risk\\trole\\tlabel\\tphase\\tpath\n")
+        f.write("# Centinela Code Scanner — all files by risk\n")
+        f.write(f"# risk: vuln=confidence, unconfirmed=max(conf,1-precise_safe), "
+                f"safe=max(1-conf,max_vuln), unknown=0\n")
+        f.write("# format: risk\\trole\\tlabel\\tphase\\tpath\n")
         f.write("#" + "-" * 78 + "\n")
         for risk, role, label, phase, p in combined:
             f.write(f"{risk:.4f}\t{role}\t{label}\t{phase}\t{p.resolve()}\n")
@@ -614,10 +770,13 @@ def write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
         "confirmed_vuln_count": len(confirmed_vulns),
         "unconfirmed_vuln_count": len(unconfirmed_vulns),
         "safe_count": len(safes),
+        "unknown_count": len(unknowns),
         "suspicious_safe_count": len(suspicious),
         "phase2_clear_threshold": PHASE2_CLEAR_THRESHOLD,
         "min_safe_conf": args["min_safe_conf"],
         "suspicious_threshold_conf": threshold_conf,
+        "chatml_wrapped": True,
+        "classifier": "argmax_logprobs_with_emitted_fallback",
     }
     with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -652,12 +811,14 @@ def main():
 
     confirmed_vulns = []
     unconfirmed_vulns = []
+    unknowns = []
 
     if mode in ("fast", "precise"):
         model = ensure_model(mode, args[f"model_{mode}"], args["no_download"])
         raw = phase_scan(files, mode, args[f"server_{mode}"], model)
         confirmed_vulns = [(p, r) for p, r in raw if r["role"] == "vuln"]
         safes = [(p, r) for p, r in raw if r["role"] == "safe"]
+        unknowns = [(p, r) for p, r in raw if r["role"] == "unknown"]
 
     else:  # fast+precise
         model_fast = ensure_model("fast", args["model_fast"], args["no_download"])
@@ -667,6 +828,7 @@ def main():
         phase1 = phase_scan(files, "fast", args["server_fast"], model_fast)
         phase1_vulns = [(p, r) for p, r in phase1 if r["role"] == "vuln"]
         phase1_safes = [(p, r) for p, r in phase1 if r["role"] == "safe"]
+        phase1_unknowns = [(p, r) for p, r in phase1 if r["role"] == "unknown"]
         print(f"phase 1 hits: {len(phase1_vulns)} / {len(files)}", file=sys.stderr)
 
         if phase1_vulns:
@@ -682,16 +844,22 @@ def main():
                     confirmed_vulns.append((p, r0))
                     continue
                 if r2["role"] == "vuln":
-                    # 1.5B confirmed as vuln (possibly different label)
                     confirmed_vulns.append((p, r2))
+                elif r2["role"] == "unknown":
+                    # 1.5B couldn't decide: keep 0.5B flag, mark unconfirmed
+                    merged = dict(r0)
+                    merged["risk"] = r0["confidence"]
+                    merged["phase2_safe_conf"] = 0.0
+                    merged["phase"] = "fast (unconfirmed-unknown)"
+                    unconfirmed_vulns.append((p, merged))
                 elif r2["confidence"] >= PHASE2_CLEAR_THRESHOLD:
-                    # 1.5B confidently says safe → truly cleared
+                    # 1.5B confidently says SAFE -> truly cleared
                     cleared += 1
                     r2_copy = dict(r2)
                     r2_copy["phase"] = "precise"
                     phase1_safes.append((p, r2_copy))
                 else:
-                    # 1.5B says SAFE but not confident → unconfirmed
+                    # 1.5B says SAFE but not confident -> unconfirmed
                     merged = dict(r0)
                     merged["risk"] = max(r0["confidence"], 1.0 - r2["confidence"])
                     merged["phase2_safe_conf"] = r2["confidence"]
@@ -703,22 +871,23 @@ def main():
             print(f"phase 2 cleared: {cleared}", file=sys.stderr)
         else:
             print("no hits from fast phase; skipping precise", file=sys.stderr)
-            confirmed_vulns = []
 
         safes = phase1_safes
+        unknowns = phase1_unknowns
 
     confirmed_vulns.sort(key=lambda x: x[1]["confidence"], reverse=True)
     unconfirmed_vulns.sort(key=lambda x: x[1]["risk"], reverse=True)
-    safes.sort(key=lambda x: x[1]["confidence"])  # ascending = most suspicious first
+    safes.sort(key=lambda x: x[1]["confidence"])
+    unknowns.sort(key=lambda x: str(x[0]))
 
-    all_results = confirmed_vulns + unconfirmed_vulns + safes
+    all_results = confirmed_vulns + unconfirmed_vulns + safes + unknowns
     threshold_conf = (args["min_safe_conf"] if args["min_safe_conf"] > 0
                       else DEFAULT_SUSPICIOUS_CONF)
 
     elapsed = time.time() - t_start
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{mode}"
     run_dir = write_reports(run_id, mode, args, confirmed_vulns, unconfirmed_vulns,
-                            safes, all_results, elapsed, threshold_conf)
+                            safes, unknowns, all_results, elapsed, threshold_conf)
     print(f"reports written to {run_dir}", file=sys.stderr)
 
     # ---- stdout ----
@@ -750,6 +919,11 @@ def main():
                 "max_vuln_label": r["max_vuln_label"],
                 "max_vuln_prob": round(r["max_vuln_prob"], 4) if r["max_vuln_prob"] else 0.0,
             })
+        for p, r in unknowns:
+            out_json.append({
+                "path": str(p.resolve()), "confidence": 0.0, "risk": 0.0,
+                "label": "UNKNOWN", "role": "unknown", "phase": r["phase"],
+            })
 
     if args["json_out"]:
         Path(args["json_out"]).write_text(json.dumps(out_json, indent=2), encoding="utf-8")
@@ -761,21 +935,23 @@ def main():
             elif item["role"] == "unconfirmed":
                 print(f"{item['risk']:.4f}\t{item['label']}\t{item['path']}"
                       f"\tUNCONFIRMED (1.5B safe={item['phase2_safe_conf']:.3f})")
-            else:
-                risk = item["risk"]
+            elif item["role"] == "safe":
                 hint = ""
                 if item.get("max_vuln_label"):
                     hint = f"\t({item['max_vuln_label']}:{item['max_vuln_prob']:.3f})"
                 marker = "\tSUSPICIOUS" if item.get("suspicious") else ""
-                print(f"{risk:.4f}\tSAFE\t{item['path']}{marker}{hint}")
+                print(f"{item['risk']:.4f}\tSAFE\t{item['path']}{marker}{hint}")
+            else:
+                print(f"0.0000\tUNKNOWN\t{item['path']}")
 
-    # ---- summary at end ----
+    # ---- summary ----
     print(f"\n=== Scan complete ===", file=sys.stderr)
     print(f"mode: {mode}", file=sys.stderr)
     print(f"total files: {len(all_results)}", file=sys.stderr)
     print(f"confirmed vulns: {len(confirmed_vulns)}", file=sys.stderr)
     print(f"unconfirmed vulns: {len(unconfirmed_vulns)}", file=sys.stderr)
     print(f"safes: {len(safes)}", file=sys.stderr)
+    print(f"unknowns: {len(unknowns)}", file=sys.stderr)
     print(f"elapsed: {elapsed/60:.1f} min", file=sys.stderr)
 
 if __name__ == "__main__":
