@@ -1,0 +1,44 @@
+{
+  "name": "simpleargumentsparser",
+  "version": "2.1.0",
+  "description": "Parse CLI arguments from node",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "scripts": {
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && sed -i 's/exports.default =/module.exports =/' dist/cjs/index.js && sed -i '/Object.defineProperty(exports, \"__esModule\"/d' dist/cjs/index.js && echo '{\"type\": \"commonjs\"}' > dist/cjs/package.json",
+    "build": "rm -rf dist && npm run build:esm && npm run build:cjs",
+    "tsc": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StringManolo/simpleArgumentsParser.git"
+  },
+  "keywords": [
+    "simple",
+    "cli",
+    "arguments",
+    "parser",
+    "node",
+    "args"
+  ],
+  "author": "stringmanolo",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/StringManolo/simpleArgumentsParser/issues"
+  },
+  "homepage": "https://github.com/StringManolo/simpleArgumentsParser#readme",
+  "devDependencies": {
+    "typescript": "^4.6.3",
+    "@types/node": "^17.0.45"
+  }
+}
