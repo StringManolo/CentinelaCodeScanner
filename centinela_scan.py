@@ -59,25 +59,53 @@ MODEL_URLS = {
 # CLI parsing via SimpleArgumentsParser (bash wrapper)
 # ---------------------------------------------------------------------------
 def parse_args():
+    """
+    Call parse_cli_json.sh, which sources SimpleArgumentsParser's bash version,
+    runs `parse_cli "$@"`, and dumps the internal state via `cli print`.
+
+    The parser returns:
+      {
+        "s": { short flags (single dash), e.g. "p": "/path", "v": true },
+        "c": { long flags (double dash), e.g. "path": "/path", "verbose": true },
+        "o": [ [positional, index], ... ],
+        "p": false,
+        "e": [],
+        "noArgs": bool,
+        "argc": int
+      }
+    """
     wrapper = Path(__file__).parent / "parse_cli_json.sh"
+    if not wrapper.is_file():
+        print(f"error: parser wrapper not found: {wrapper}", file=sys.stderr)
+        sys.exit(2)
+
     result = subprocess.run(
         ["bash", str(wrapper)] + sys.argv[1:],
         capture_output=True, text=True, check=True,
     )
-    raw = json.loads(result.stdout)
+    parsed = json.loads(result.stdout)
+    c = parsed.get("c", {}) or {}
+    s = parsed.get("s", {}) or {}
 
-    path = raw.get("path") or ""
+    def get(long_name, short_name=None):
+        if long_name in c:
+            return c[long_name]
+        if short_name and short_name in s:
+            return s[short_name]
+        return None
+
+    path = get("path", "p") or ""
     if not path:
         print("error: --path / -p <directory> is required", file=sys.stderr)
         sys.exit(2)
 
-    server_fast = raw.get("server_fast") or None
-    server_precise = raw.get("server_precise") or None
+    server_fast = get("server-fast") or None
+    server_precise = get("server-precise") or None
 
     if server_fast and server_precise:
         mode = "fast+precise"
     else:
-        mode = raw.get("mode") or "fast"
+        mode = get("mode") or "fast"
         if mode not in ("fast", "precise", "fast+precise"):
             print(f"error: invalid --mode {mode!r}", file=sys.stderr)
             sys.exit(2)
@@ -88,15 +116,21 @@ def parse_args():
             print("error: --server-precise given but mode=fast", file=sys.stderr)
             sys.exit(2)
 
+    no_dl = get("no-download")
+    if isinstance(no_dl, str):
+        no_download = no_dl.lower() in ("true", "1", "yes")
+    else:
+        no_download = bool(no_dl)
+
     return {
         "path": Path(path).expanduser().resolve(),
         "mode": mode,
         "server_fast": server_fast,
         "server_precise": server_precise,
-        "model_fast": raw.get("model_fast") or None,
-        "model_precise": raw.get("model_precise") or None,
-        "json_out": raw.get("json_out") or None,
-        "no_download": bool(raw.get("no_download")),
+        "model_fast": get("model-fast") or None,
+        "model_precise": get("model-precise") or None,
+        "json_out": get("json") or None,
+        "no_download": no_download,
     }
 
 # ---------------------------------------------------------------------------
@@ -235,7 +269,7 @@ def classify_chunk(server: str, code: str) -> tuple[str, float]:
 
     Confidence = geometric mean of the per-token probabilities of the predicted
     label. Length-normalised so multi-token labels are comparable to single-token
-    ones. SAFE → confidence 0.0 (so safe chunks are filtered out).
+    ones. SAFE -> confidence 0.0 (so safe chunks are filtered out).
     """
     prompt = PROMPT_TMPL.format(labels=", ".join(LABELS), code=code)
     payload = {
