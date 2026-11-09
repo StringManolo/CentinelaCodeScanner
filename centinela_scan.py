@@ -71,8 +71,8 @@ MODEL_URLS = {
     ),
     "precise": (
         "https://github.com/StringManolo/centinela-0.5b/releases/download/"
-        "centinela-2026-11-09-42598667777-1.5B-rslora%2Brank32-qwen25/"
-        "centinela-2026-11-09-42598667777-1.5B-rslora+rank32-qwen25-Q4_K_M.gguf"
+        "centinela-2026-11-09-42640383718-1.5B-rslora%2Brank32/"
+        "centinela-2026-11-09-42640383718-1.5B-rslora+rank32-Q4_K_M.gguf"
     ),
 }
 
